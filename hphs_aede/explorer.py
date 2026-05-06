@@ -5,15 +5,16 @@ from rclpy.node import Node
 import cv2
 import numpy as np
 import math
+import heapq
 import tf2_ros
 import sensor_msgs_py.point_cloud2 as pc2
 from numpy import inf
 from hphs_aede.utils import distance, orientation, diagonal_distance, PolarToCartesian
 from std_msgs.msg import Float32
 from sensor_msgs.msg import PointCloud2
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Point, PointStamped
+from geometry_msgs.msg import Point, PointStamped, PoseStamped
 from collections import deque, defaultdict
 from copy import copy
 from itertools import permutations
@@ -119,6 +120,12 @@ class Explorer(Node):
         self.local_goal = [0.0, 0.0]
         self.end_exploration = False
 
+        # A* path cache – re-plan only when goal changes
+        self._cached_goal = None
+        self._cached_path = []  # list of [x, y] world coords
+        self.LOOKAHEAD_DIST = 2.0  # metres
+        self.REPLAN_THRESH  = 0.5  # re-plan if goal shifted more than this
+
         # Publisher
         self.total_frontiers_pub = self.create_publisher(Marker, "/total_frontiers", 1)
         self.gap_frontiers_pub = self.create_publisher(Marker, "/gap_frontiers", 1)
@@ -130,7 +137,8 @@ class Explorer(Node):
         self.global_path_pub = self.create_publisher(Marker, "/global_path", 1)
         self.local_goal_pub = self.create_publisher(Marker, "/local_goal", 1)
         self.waypoint_pub = self.create_publisher(PointStamped, "/way_point", 1)
-        self.runtime_pub = self.create_publisher(Float32, "/runtime", 1)
+        self.path_pub     = self.create_publisher(Path, "/hphs_planned_path", 1)
+        self.runtime_pub  = self.create_publisher(Float32, "/runtime", 1)
         
         # Subscriber
         self.cloud_sub = self.create_subscription(PointCloud2, "/sensor_scan", self.cloud_callback, 1)
@@ -182,41 +190,72 @@ class Explorer(Node):
         self.map_origin_y = map_data.info.origin.position.y
         self.resizeMap()
 
-    def _plan_path_bfs(self, start_world, goal_world):
-        """BFS path on occupancy grid – ROS2 equivalent of move_base global plan."""
+    def _is_obstacle(self, val):
+        # Only treat definitely occupied cells [50,100] as obstacles.
+        # Free (0-49) and unknown (-1 / 255 stored as uint8) are passable.
+        return 50 <= val <= 100
+
+    def _plan_path_astar(self, start_world, goal_world):
+        """A* on occupancy grid. Returns list of [x, y] world coords."""
         if self.map_width == 0 or len(self.map_data) == 0:
             return []
-        OBSTACLE_THRESH = 50
-        MAX_NODES = 50000
         sx, sy = self.CoordToIndex(start_world)
         gx, gy = self.CoordToIndex(goal_world)
-        if self.map_data[gx + gy * self.map_width] >= OBSTACLE_THRESH:
+        if self._is_obstacle(self.map_data[gx + gy * self.map_width]):
             return []
-        queue = deque([(sx, sy)])
-        parent = {(sx, sy): None}
-        dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
-        found = False
-        while queue and len(parent) < MAX_NODES:
-            cx, cy = queue.popleft()
+
+        def h(x, y):
+            return math.hypot(x - gx, y - gy)
+
+        open_set = []
+        heapq.heappush(open_set, (h(sx, sy), 0.0, sx, sy))
+        g_score = {(sx, sy): 0.0}
+        parent  = {(sx, sy): None}
+        dirs = [(1,0,1.0),(-1,0,1.0),(0,1,1.0),(0,-1,1.0),
+                (1,1,1.414),(-1,1,1.414),(1,-1,1.414),(-1,-1,1.414)]
+
+        while open_set:
+            _, cur_g, cx, cy = heapq.heappop(open_set)
             if cx == gx and cy == gy:
-                found = True
-                break
-            for dx, dy in dirs:
+                path, node = [], (gx, gy)
+                while node is not None:
+                    path.append(list(self.IndexToCoord(node)))
+                    node = parent[node]
+                path.reverse()
+                return path
+            if cur_g > g_score.get((cx, cy), float('inf')):
+                continue
+            for dx, dy, cost in dirs:
                 nx, ny = cx + dx, cy + dy
                 if 0 <= nx < self.map_width and 0 <= ny < self.map_height:
-                    if (nx, ny) not in parent:
-                        if self.map_data[nx + ny * self.map_width] < OBSTACLE_THRESH:
-                            parent[(nx, ny)] = (cx, cy)
-                            queue.append((nx, ny))
-        if not found:
-            return []
-        path = []
-        node = (gx, gy)
-        while node is not None:
-            path.append(list(self.IndexToCoord(node)))
-            node = parent[node]
-        path.reverse()
-        return path
+                    if not self._is_obstacle(self.map_data[nx + ny * self.map_width]):
+                        ng = cur_g + cost
+                        if ng < g_score.get((nx, ny), float('inf')):
+                            g_score[(nx, ny)] = ng
+                            parent[(nx, ny)]  = (cx, cy)
+                            heapq.heappush(open_set, (ng + h(nx, ny), ng, nx, ny))
+        return []
+
+    def _get_lookahead_waypoint(self, path, lookahead_dist):
+        """Pure-pursuit lookahead: find closest point on path to robot,
+        then advance lookahead_dist metres along the path."""
+        if not path:
+            return None
+        robot = [self.odom_x, self.odom_y]
+        # Find index of closest path point to robot
+        min_d, closest = float('inf'), 0
+        for i, pt in enumerate(path):
+            d = math.hypot(pt[0] - robot[0], pt[1] - robot[1])
+            if d < min_d:
+                min_d, closest = d, i
+        # Walk forward from closest until accumulated distance >= lookahead_dist
+        acc = 0.0
+        for i in range(closest, len(path) - 1):
+            seg = math.hypot(path[i+1][0] - path[i][0], path[i+1][1] - path[i][1])
+            acc += seg
+            if acc >= lookahead_dist:
+                return path[i + 1]
+        return path[-1]
 
     def IndexToCoord(self, idx):
         x = (idx[0] + 0.5) * self.map_resolution + self.map_origin_x
@@ -700,37 +739,70 @@ class Explorer(Node):
         return h
 
     def selectLocalGoal(self):
+        if len(self.classflied_frontiers) == 0:
+            return
+        frontiers_in_selected_subregion = self.classflied_frontiers[self.selected_subregion]
+        if len(frontiers_in_selected_subregion) == 0:
+            return
+
+        # Goal commitment: keep current goal while it is still a valid frontier
+        # in the selected subregion.  Only switch if the goal has been removed.
+        if len(self.local_goal) > 0:
+            for frontier in frontiers_in_selected_subregion:
+                if math.hypot(float(frontier[0]) - self.local_goal[0],
+                              float(frontier[1]) - self.local_goal[1]) < 0.5:
+                    return  # current goal still valid, keep it
+
+        # Current goal gone – select the cheapest frontier
         min_cost = inf
         local_goal = []
-        if len(self.classflied_frontiers) > 0:
-            frontiers_in_selected_subregion = self.classflied_frontiers[self.selected_subregion]
-            for frontier in frontiers_in_selected_subregion:
-                cost = self.heurisitic(frontier)
-                if cost < min_cost:
-                    min_cost = cost
-                    local_goal = frontier
+        for frontier in frontiers_in_selected_subregion:
+            cost = self.heurisitic(frontier)
+            if cost < min_cost:
+                min_cost = cost
+                local_goal = frontier
+        if len(local_goal) > 0:
             self.local_goal = local_goal
 
     def sendLocalGoal(self):
-        if not self.local_goal:
+        if self.local_goal is None or len(self.local_goal) == 0:
             return
-        # Plan a collision-free path (equivalent to move_base global plan)
-        path = self._plan_path_bfs([self.odom_x, self.odom_y], self.local_goal)
+        goal = [float(self.local_goal[0]), float(self.local_goal[1])]
+
+        # Re-plan A* only when goal has changed significantly
+        if (self._cached_goal is None or
+                math.hypot(goal[0] - self._cached_goal[0],
+                           goal[1] - self._cached_goal[1]) > self.REPLAN_THRESH):
+            self._cached_path = self._plan_path_astar(
+                [self.odom_x, self.odom_y], goal)
+            self._cached_goal = goal
+
+        # Always publish cached path for RViz (every frame)
+        path_msg = Path()
+        path_msg.header.frame_id = "map"
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        for pt in self._cached_path:
+            ps = PoseStamped()
+            ps.header.frame_id = "map"
+            ps.pose.position.x = float(pt[0])
+            ps.pose.position.y = float(pt[1])
+            ps.pose.position.z = 0.75
+            ps.pose.orientation.w = 1.0
+            path_msg.poses.append(ps)
+        self.path_pub.publish(path_msg)
+
+        # Pure-pursuit lookahead waypoint along cached path
+        wp = self._get_lookahead_waypoint(self._cached_path, self.LOOKAHEAD_DIST)
+        if wp is None:
+            wp = goal  # fallback: send goal directly
+
         waypoint = PointStamped()
         waypoint.header.frame_id = "map"
         waypoint.header.stamp = self.get_clock().now().to_msg()
-        waypoint.point.z = 0.75
-        if len(path) > 15:
-            wp = path[15]
-        elif path:
-            wp = path[-1]
-        else:
-            # No reachable path – fall back to direct goal
-            wp = self.local_goal
         waypoint.point.x = float(wp[0])
         waypoint.point.y = float(wp[1])
+        waypoint.point.z = 0.75
         self.waypoint_pub.publish(waypoint)
-        # Note: Prevents frequent sending of targets
         time_module.sleep(0.1)
     ## ------------------------------------------------------------------------- ##
     
